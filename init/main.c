@@ -906,108 +906,237 @@ static void __init early_numa_node_init(void)
 #endif
 }
 
-#define KERNEL_CMDLINE_PREFIX		"Kernel command line: "
-#define KERNEL_CMDLINE_PREFIX_LEN	(sizeof(KERNEL_CMDLINE_PREFIX) - 1)
-#define KERNEL_CMDLINE_CONTINUATION	" \\"
-#define KERNEL_CMDLINE_CONTINUATION_LEN	(sizeof(KERNEL_CMDLINE_CONTINUATION) - 1)
-
-#define MIN_CMDLINE_LOG_WRAP_IDEAL_LEN	(KERNEL_CMDLINE_PREFIX_LEN + \
-					 KERNEL_CMDLINE_CONTINUATION_LEN)
-#define CMDLINE_LOG_WRAP_IDEAL_LEN	(CONFIG_CMDLINE_LOG_WRAP_IDEAL_LEN > \
-					 MIN_CMDLINE_LOG_WRAP_IDEAL_LEN ? \
-					 CONFIG_CMDLINE_LOG_WRAP_IDEAL_LEN : \
-					 MIN_CMDLINE_LOG_WRAP_IDEAL_LEN)
-
-#define IDEAL_CMDLINE_LEN		(CMDLINE_LOG_WRAP_IDEAL_LEN - KERNEL_CMDLINE_PREFIX_LEN)
-#define IDEAL_CMDLINE_SPLIT_LEN		(IDEAL_CMDLINE_LEN - KERNEL_CMDLINE_CONTINUATION_LEN)
-
-/**
- * print_kernel_cmdline() - Print the kernel cmdline with wrapping.
- * @cmdline: The cmdline to print.
- *
- * Print the kernel command line, trying to wrap based on the Kconfig knob
- * CONFIG_CMDLINE_LOG_WRAP_IDEAL_LEN.
- *
- * Wrapping is based on spaces, ignoring quotes. All lines are prefixed
- * with "Kernel command line: " and lines that are not the last line have
- * a " \" suffix added to them. The prefix and suffix count towards the
- * line length for wrapping purposes. The ideal length will be exceeded
- * if no appropriate place to wrap is found.
- *
- * Example output if CONFIG_CMDLINE_LOG_WRAP_IDEAL_LEN is 40:
- *   Kernel command line: loglevel=7 \
- *   Kernel command line: init=/sbin/init \
- *   Kernel command line: root=PARTUUID=8c3efc1a-768b-6642-8d0c-89eb782f19f0/PARTNROFF=1 \
- *   Kernel command line: rootwait ro \
- *   Kernel command line: my_quoted_arg="The \
- *   Kernel command line: quick brown fox \
- *   Kernel command line: jumps over the \
- *   Kernel command line: lazy dog."
- */
-static void __init print_kernel_cmdline(const char *cmdline)
-{
-	size_t len;
-
-	/* Config option of 0 or anything longer than the max disables wrapping */
-	if (CONFIG_CMDLINE_LOG_WRAP_IDEAL_LEN == 0 ||
-	    IDEAL_CMDLINE_LEN >= COMMAND_LINE_SIZE - 1) {
-		pr_notice("%s%s\n", KERNEL_CMDLINE_PREFIX, cmdline);
-		return;
-	}
-
-	len = strlen(cmdline);
-	while (len > IDEAL_CMDLINE_LEN) {
-		const char *first_space;
-		const char *prev_cutoff;
-		const char *cutoff;
-		int to_print;
-		size_t used;
-
-		/* Find the last ' ' that wouldn't make the line too long */
-		prev_cutoff = NULL;
-		cutoff = cmdline;
-		while (true) {
-			cutoff = strchr(cutoff + 1, ' ');
-			if (!cutoff || cutoff - cmdline > IDEAL_CMDLINE_SPLIT_LEN)
-				break;
-			prev_cutoff = cutoff;
-		}
-		if (prev_cutoff)
-			cutoff = prev_cutoff;
-		else if (!cutoff)
-			break;
-
-		/* Find the beginning and end of the string of spaces */
-		first_space = cutoff;
-		while (first_space > cmdline && first_space[-1] == ' ')
-			first_space--;
-		to_print = first_space - cmdline;
-		while (*cutoff == ' ')
-			cutoff++;
-		used = cutoff - cmdline;
-
-		/* If the whole string is used, break and do the final printout */
-		if (len == used)
-			break;
-
-		if (to_print)
-			pr_notice("%s%.*s%s\n", KERNEL_CMDLINE_PREFIX,
-				  to_print, cmdline, KERNEL_CMDLINE_CONTINUATION);
-
-		len -= used;
-		cmdline += used;
-	}
-	if (len)
-		pr_notice("%s%s\n", KERNEL_CMDLINE_PREFIX, cmdline);
-}
-
 asmlinkage __visible __init __no_sanitize_address __noreturn __no_stack_protector
-void start_kernel(void)
+void start_kernel(void) //시작
 {
+	/* 로컬 변수 선언: 리눅스 커널 코딩 스타일 규칙
+	 *
+	 * 리눅스 커널 코딩 스타일 (Documentation/process/coding-style.rst):
+	 * - 변수는 함수 시작 부분에 선언하는 것이 선호됨
+	 * - "reverse fir tree order"로 선언: 긴 타입부터 짧은 타입 순서
+	 *   * "fir tree" = 전나무 (크리스마스 트리 모양: 위가 좁고 아래가 넓음)
+	 *   * "reverse fir tree" = 역전나무 (역삼각형: 위가 넓고 아래가 좁음)
+	 *   * 즉, 변수 선언을 위에서 아래로 갈수록 짧아지게 배치
+	 *   * 예시:
+	 *     struct long_struct_name *descriptive_name;  // 가장 긴 타입 (위)
+	 *     unsigned long foo, bar;                     // 중간 길이
+	 *     unsigned int tmp;                           // 중간 길이
+	 *     int ret;                                     // 가장 짧은 타입 (아래)
+	 *   * 이렇게 하면 파서가 더 빠르게 처리할 수 있음 (Documentation/process/maintainer-tip.rst:651)
+	 * - 같은 타입의 변수는 한 줄에 묶는 것이 좋음 (공간 절약)
+	 * - 초기화는 선언과 분리하는 것이 선호됨
+	 *
+	 * 커널 커맨드 라인의 출처와 전달 과정:
+	 *
+	 * 1. 사용자가 부트로더에 커맨드 라인 입력
+	 *    - GRUB 예시: GRUB 메뉴에서 'e' 키를 눌러 편집
+	 *      linux /vmlinuz-5.x.x root=/dev/sda1 console=ttyS0,115200
+	 *    - 또는 GRUB 설정 파일(/boot/grub/grub.cfg)에:
+	 *      linux /vmlinuz root=/dev/sda1 console=ttyS0
+	 *    - 이것은 "./linux --help" 같은 형식이 아니라, 부팅 시 커널에 전달되는 파라미터
+	 *
+	 * 2. 부트로더가 커맨드 라인을 메모리에 저장하는 과정 (x86 아키텍처)
+	 *
+	 *    [비유] 편지를 보내는 과정과 비슷합니다:
+	 *    - 편지 내용(커맨드 라인 문자열)을 어딘가에 두고
+	 *    - 편지함(boot_params)에 그 위치를 적어둠
+	 *    - 받는 사람(커널)이 편지함을 열어서 위치를 보고 편지를 가져옴
+	 *
+	 *    [실제 메모리 레이아웃 예시]
+	 *    메모리 주소          내용
+	 *    ──────────────────────────────────────────────
+	 *    0x10000            "root=/dev/sda1 console=ttyS0"  <- 커맨드 라인 문자열
+	 *    ...                (다른 데이터들)
+	 *    0x90000            boot_params 구조체 시작
+	 *                       └─ hdr.cmd_line_ptr = 0x10000   <- 여기에 주소 저장!
+	 *
+	 *    [단계별 설명]
+	 *
+	 *    단계 1: GRUB이 커맨드 라인 문자열을 메모리에 저장
+	 *    - 사용자가 입력한 "root=/dev/sda1 console=ttyS0" 문자열을
+	 *      메모리의 특정 위치(예: 0x10000)에 복사
+	 *    - 이 위치는 부트로더가 자유롭게 선택 가능 (0x10000 ~ 0xA0000 사이)
+	 *
+	 *    단계 2: GRUB이 그 주소를 boot_params 구조체에 기록
+	 *    - boot_params는 부트로더와 커널이 정보를 주고받는 구조체
+	 *      * 정의: arch/x86/include/uapi/asm/bootparam.h:116
+	 *      * 크기: 약 4KB 정도의 큰 구조체
+	 *      * 위치: 보통 0x90000 근처에 위치
+	 *    - boot_params 안에는 setup_header 구조체가 포함되어 있음
+	 *      * 정의: arch/x86/include/uapi/asm/bootparam.h:38
+	 *      * boot_params.hdr가 이 구조체를 가리킴
+	 *    - setup_header 안에 cmd_line_ptr 필드가 있음 (line 62)
+	 *      * 타입: __u32 (32비트 정수 = 4바이트)
+	 *      * 의미: 커맨드 라인 문자열이 있는 메모리 주소(물리 주소)
+	 *      * GRUB이 여기에 0x10000 같은 값을 써넣음
+	 *
+	 *    단계 3: 커널이 부팅되면서 이 주소를 읽어서 커맨드 라인을 가져옴
+	 *    - 코드 위치: arch/x86/kernel/head64.c:194-211 (copy_bootdata 함수)
+	 *    - 과정:
+	 *      1) boot_params 구조체를 메모리에서 읽어옴 (line 205)
+	 *      2) get_cmd_line_ptr() 호출 (line 207)
+	 *         - boot_params.hdr.cmd_line_ptr 값을 읽음 (line 187)
+	 *         - 64비트 시스템에서는 ext_cmd_line_ptr도 함께 사용 (line 189)
+	 *         - 결과: 예를 들어 0x10000 같은 물리 주소 반환
+	 *      3) __va(cmd_line_ptr) 호출 (line 209)
+	 *         - 물리 주소를 가상 주소로 변환
+	 *         - 예: 물리 주소 0x10000 → 가상 주소 0xffff8800000010000
+	 *      4) memcpy로 boot_command_line에 복사 (line 210)
+	 *         - boot_command_line 정의: init/main.c:143
+	 *         - 크기: COMMAND_LINE_SIZE (보통 2048 바이트)
+	 *
+	 *    [핵심 개념]
+	 *    - cmd_line_ptr은 "포인터"입니다. 즉, 실제 문자열이 아니라
+	 *      문자열이 있는 위치를 가리키는 주소입니다.
+	 *    - 마치 집 주소를 적어두는 것과 같습니다:
+	 *      * "서울시 강남구..." (주소 = cmd_line_ptr)
+	 *      * vs 실제 집 (커맨드 라인 문자열)
+	 *    - GRUB은 실제 문자열을 메모리에 두고, 그 주소만 boot_params에 기록
+	 *    - 커널은 그 주소를 읽어서 실제 문자열을 가져옴
+	 *
+	 *    - ARM/ARM64 아키텍처의 경우:
+	 *      * Device Tree의 "bootargs" 속성 사용
+	 *      * 또는 레거시 ATAG(ARM Tagged List) 사용
+	 *      * 예시: Device Tree에 "bootargs = "root=/dev/sda1 console=ttyS0";"
+	 *
+	 *    - EFI 시스템의 경우:
+	 *      * EFI Loaded Image Protocol 사용
+	 *      * efi_handle_cmdline() 함수: drivers/firmware/efi/libstub/efi-stub.c:105
+	 *      * EFI에서 커맨드 라인을 가져와서 Device Tree나 boot_params에 설정
+	 *
+	 * 3. 커널이 커맨드 라인을 읽어서 처리
+	 *    - x86: head64.c의 copy_bootdata()에서 boot_command_line에 복사
+	 *    - setup_arch()에서 아키텍처별로 추가 처리 (arch/x86/kernel/setup.c:880)
+	 *    - setup_command_line()에서 저장 (init/main.c:644)
+	 *    - parse_args()로 파싱하여 각 파라미터 처리
+	 *
+	 * 참고:
+	 * - "./linux --help" 같은 형식이 아님
+	 * - 부팅 시 부트로더가 커널 이미지와 함께 커맨드 라인을 메모리에 준비
+	 * - 커널은 부팅 초기에 이 메모리 위치에서 커맨드 라인을 읽어옴
+	 * - 커맨드 라인은 커널 파라미터와 init 프로세스 인자를 모두 포함
+	 * - "--" 구분자로 커널 파라미터와 init 인자를 구분
+	 *
+	 * 이 변수들의 용도:
+	 *
+	 * 1. command_line: 아키텍처별로 처리된 커널 커맨드 라인
+	 *    - setup_arch(&command_line) 호출 시 포인터로 전달 (init/main.c:1023)
+	 *    - setup_arch() 함수 정의: arch/*/kernel/setup.c (아키텍처별로 다름)
+	 *    - setup_arch()에서 아키텍처별 커맨드 라인 파싱 및 처리 후 포인터 반환
+	 *    - 사용 위치:
+	 *      * setup_command_line(command_line): 커맨드 라인 저장 (init/main.c:1029)
+	 *        - 함수 정의: init/main.c:644
+	 *        - saved_command_line, static_command_line에 저장
+	 *      * random_init_early(command_line): 랜덤 초기화 (init/main.c:1052)
+	 *        - 커맨드 라인에서 랜덤 관련 파라미터 파싱
+	 *
+	 * 2. after_dashes: 커맨드 라인에서 "--" 이후의 인자들
+	 *    - parse_args() 함수가 "--"를 만나면 그 이후 문자열을 반환
+	 *    - parse_args() 정의: kernel/params.c:161
+	 *    - "--"는 커널 파라미터와 init 프로세스 인자를 구분하는 구분자
+	 *    - 사용 위치:
+	 *      * parse_args("Booting kernel", ...) 반환값 저장 (init/main.c:1039)
+	 *      * parse_args("Setting init args", after_dashes, ...) 호출 (init/main.c:1045)
+	 *        - "--" 이후의 인자들을 init 프로세스에 전달하기 위해 파싱
+	 *    - 예시: "console=ttyS0 -- init=/bin/sh"
+	 *      * "console=ttyS0"는 커널 파라미터로 파싱
+	 *      * "--" 이후의 "init=/bin/sh"는 after_dashes에 저장되어 init에 전달
+	 *    - 참고: init 프로세스는 이 인자들을 argv로 받음
+	 */
 	char *command_line;
 	char *after_dashes;
 
-	 // Stackoverflow 가 발생하는지 검증하기 위해 init_task 스택의 마지막에 매직 값을 넣어주고 그 값이 변조되었는지 확인하도록 함
+	/* init_task는 어디서 오는가?
+	 * - 정의 위치: init/init_task.c:96 (struct task_struct init_task)
+	 * - 커널 이미지에 정적으로 할당된 전역 변수 (컴파일 타임에 생성됨)
+	 * - 부팅 시 가장 먼저 존재하는 태스크 (PID 0, "swapper" 프로세스)
+	 * - 동적 할당 없이 바로 사용 가능하므로 부팅 초기에 안전하게 사용 가능
+	 *
+	 * init_task의 역할:
+	 *
+	 * 1. 모든 프로세스의 조상 (모든 프로세스의 부모/조부모)
+	 *    - init_task는 PID 0을 가지며, 시스템의 모든 프로세스 트리의 루트
+	 *    - init_task의 parent, real_parent는 자기 자신을 가리킴 (init/init_task.c:344-345)
+	 *    - 모든 프로세스는 init_task.tasks 리스트에 연결됨 (kernel/fork.c:2416)
+	 *    - init 프로세스(PID 1) 생성:
+	 *      * rest_init()에서 user_mode_thread(kernel_init, ...) 호출 (init/main.c:722)
+	 *      * kernel_init()이 나중에 실제 init 프로그램(/sbin/init 등) 실행 (init/main.c:1520-1593)
+	 *      * fork 시 real_parent가 current(init_task)로 설정되어 자식이 됨 (kernel/fork.c:2415)
+	 *    - 고아 프로세스 입양 메커니즘:
+	 *      * 프로세스 종료 시 forget_original_parent() 호출 (kernel/exit.c:699)
+	 *      * find_new_reaper()로 새로운 부모 찾기 (kernel/exit.c:637)
+	 *      * 최종적으로 child_reaper(보통 PID 1)가 입양하지만, 네임스페이스 최상위는 init_task
+	 *      * 실제 입양은 reparent_leader()에서 수행 (kernel/exit.c:675)
+	 *    - 참고: 일반적으로 PID 1(init)이 고아를 입양하지만, init_task는 프로세스 트리 루트
+	 *
+	 * 2. CPU가 실행할 태스크가 없을 때 실행되는 idle 태스크 (swapper)
+	 *    - 스케줄러가 실행할 다른 태스크가 없을 때 init_task가 실행됨
+	 *    - 스케줄러는 idle_sched_class의 pick_task_idle()로 idle 태스크 선택 (kernel/sched/idle.c:473)
+	 *    - 이때 init_task는 CPU를 낭비하지 않고 전력 절약을 위해 대기 상태로 전환
+	 *    - 동작 방식 (코드 흐름):
+	 *      * rest_init()에서 cpu_startup_entry(CPUHP_ONLINE) 호출 (init/main.c:757)
+	 *      * cpu_startup_entry()가 무한 루프로 do_idle() 호출 (kernel/sched/idle.c:424-430)
+	 *      * do_idle() 내부에서 need_resched()가 false일 때까지 반복 (kernel/sched/idle.c:280)
+	 *      * arch_cpu_idle_enter() 호출 (kernel/sched/idle.c:319)
+	 *      * cpuidle_idle_call() 또는 arch_cpu_idle() 호출 (kernel/sched/idle.c:332)
+	 *      * x86의 경우: default_idle() -> raw_safe_halt() -> native_safe_halt() (arch/x86/kernel/process.c:765-767)
+	 *      * native_safe_halt()에서 "sti; hlt" 어셈블리 명령 실행 (arch/x86/include/asm/irqflags.h:45-49)
+	 *      * ARM의 경우: WFI (Wait For Interrupt) 명령 실행
+	 *      * CPU 하드웨어 레벨에서 CPU를 저전력 대기 상태로 전환
+	 *      * 인터럽트가 발생하면 CPU가 깨어나서 다시 스케줄링 수행
+	 *    - 단순히 "pass"하는 것이 아니라 실제 CPU 명령어를 실행하여 하드웨어를 제어
+	 *    - idle 태스크 설정:
+	 *      * start_kernel() -> sched_init() -> init_idle(current, smp_processor_id()) (kernel/sched/core.c:8724)
+	 *      * init_idle() 정의: kernel/sched/core.c:7889
+	 *      * init_idle()에서 idle->sched_class = &idle_sched_class 설정 (kernel/sched/core.c:7943)
+	 *      * init_idle()에서 idle 태스크 이름을 "swapper/0", "swapper/1" 등으로 설정 (kernel/sched/core.c:7946)
+	 *    - 커맨드 이름이 "swapper"인 이유: 과거에는 메모리 스와핑을 담당했기 때문
+	 *    - INIT_TASK_COMM 매크로 정의: include/linux/init_task.h:37 ("swapper")
+	 *
+	 * 3. 커널 부팅 초기 단계에서 실행되는 태스크
+	 *    - start_kernel() 함수가 실행되는 동안 init_task가 현재 실행 중인 태스크
+	 *    - 아직 다른 프로세스가 생성되기 전이므로 init_task가 유일한 실행 컨텍스트
+	 *    - 스케줄러 초기화:
+	 *      * sched_init() 호출: init/main.c:1061
+	 *      * sched_init() 내부에서 init_idle() 호출로 idle 태스크로 설정
+	 *    - 다른 프로세스 생성:
+	 *      * rest_init() 호출: init/main.c:1202 (start_kernel()의 마지막 부분)
+	 *      * rest_init()에서 init 프로세스(PID 1)와 kthreadd(PID 2) 생성
+	 *      * 그 후 init_task는 idle 태스크로 전환되어 cpu_startup_entry() 진입
+	 *    - 정적으로 할당되어 있어 동적 메모리 할당자(kmalloc)가 준비되기 전에도 사용 가능
+	 *    - init_task는 컴파일 타임에 생성되므로 부팅 초기 단계에서 안전하게 사용 가능
+	 *    - 참고: current 매크로가 init_task를 가리키는 시점은 start_kernel() 시작부터
+	 *            rest_init()에서 다른 프로세스 생성 전까지
+	 *
+	 * 4. 나중에 각 CPU마다 idle 태스크가 생성되지만, init_task는 최초의 것
+	 *    - SMP(다중 프로세서) 시스템에서는 각 CPU마다 별도의 idle 태스크가 필요
+	 *    - 부팅 CPU(boot CPU)는 init_task를 그대로 idle 태스크로 사용
+	 *      * idle_thread_set_boot_cpu() 호출: kernel/sched/core.c:8728
+	 *      * kernel/smpboot.c:37-40에서 per_cpu(idle_threads, boot_cpu) = current 설정
+	 *    - 다른 CPU들의 idle 태스크 생성:
+	 *      * idle_threads_init() 호출로 모든 CPU 초기화 (kernel/smpboot.c:64)
+	 *      * idle_init() 함수에서 fork_idle() 호출 (kernel/smpboot.c:48-58)
+	 *      * fork_idle() 정의: kernel/fork.c:2540
+	 *      * fork_idle()은 copy_process()를 통해 init_task를 복제
+	 *    - 각 CPU의 idle 태스크는 "swapper/0", "swapper/1" 등으로 이름이 붙음
+	 *      * init_idle()에서 sprintf(idle->comm, "%s/%d", INIT_TASK_COMM, cpu)로 설정
+	 *    - init_task는 부팅 CPU의 idle 태스크로 계속 사용됨
+	 *
+	 * 여기서 하는 일 (set_task_stack_end_magic):
+	 * - init_task의 커널 스택 끝에 매직 넘버(STACK_END_MAGIC)를 설정
+	 * - 함수 정의: kernel/fork.c:871
+	 * - 스택 오버플로우 감지를 위한 초기화
+	 * - 매직 넘버 값: 0x57AC6E9D (include/linux/sched/task_stack.h)
+	 * - 디버깅이나 크래시 상황에서 스택이 넘쳤는지 확인 가능
+	 * - 매직 넘버가 덮어써지면 스택 오버플로우로 판단
+	 *
+	 * 추가 정보:
+	 * - init_task는 절대 종료되지 않음 (usage 카운트가 2로 설정되어 해제 불가, init/init_task.c:124)
+	 * - init_task는 PID 0을 가지며, 이는 특별한 의미를 가짐 (일반 프로세스는 PID 1부터 시작)
+	 * - init_task는 커널 스레드이므로 사용자 공간이 없음 (mm = NULL, active_mm = &init_mm, init/init_task.c:122-123)
+	 * - 모든 프로세스는 init_task.tasks 리스트에 연결되어 전역 프로세스 리스트를 형성 (kernel/fork.c:2416)
+	 * - init_task는 root 권한을 가짐 (init_cred: UID/GID 0, 모든 capability, init/init_task.c:71-90)
+	 */
 	set_task_stack_end_magic(&init_task);
 	smp_setup_processor_id();
 	debug_objects_early_init();
@@ -1038,7 +1167,7 @@ void start_kernel(void)
 	early_numa_node_init();
 	boot_cpu_hotplug_init();
 
-	print_kernel_cmdline(saved_command_line);
+	pr_notice("Kernel command line: %s\n", saved_command_line);
 	/* parameters may set static keys */
 	parse_early_param();
 	after_dashes = parse_args("Booting kernel",

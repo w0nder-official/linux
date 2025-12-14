@@ -106,9 +106,9 @@
 #include <linux/pidfs.h>
 #include <linux/tick.h>
 #include <linux/unwind_deferred.h>
-#include <linux/pgalloc.h>
-#include <linux/uaccess.h>
 
+#include <asm/pgalloc.h>
+#include <linux/uaccess.h>
 #include <asm/mmu_context.h>
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
@@ -208,62 +208,15 @@ struct vm_stack {
 	struct vm_struct *stack_vm_area;
 };
 
-static struct vm_struct *alloc_thread_stack_node_from_cache(struct task_struct *tsk, int node)
-{
-	struct vm_struct *vm_area;
-	unsigned int i;
-
-	/*
-	 * If the node has memory, we are guaranteed the stacks are backed by local pages.
-	 * Otherwise the pages are arbitrary.
-	 *
-	 * Note that depending on cpuset it is possible we will get migrated to a different
-	 * node immediately after allocating here, so this does *not* guarantee locality for
-	 * arbitrary callers.
-	 */
-	scoped_guard(preempt) {
-		if (node != NUMA_NO_NODE && numa_node_id() != node)
-			return NULL;
-
-		for (i = 0; i < NR_CACHED_STACKS; i++) {
-			vm_area = this_cpu_xchg(cached_stacks[i], NULL);
-			if (vm_area)
-				return vm_area;
-		}
-	}
-
-	return NULL;
-}
-
 static bool try_release_thread_stack_to_cache(struct vm_struct *vm_area)
 {
 	unsigned int i;
-	int nid;
 
-	/*
-	 * Don't cache stacks if any of the pages don't match the local domain, unless
-	 * there is no local memory to begin with.
-	 *
-	 * Note that lack of local memory does not automatically mean it makes no difference
-	 * performance-wise which other domain backs the stack. In this case we are merely
-	 * trying to avoid constantly going to vmalloc.
-	 */
-	scoped_guard(preempt) {
-		nid = numa_node_id();
-		if (node_state(nid, N_MEMORY)) {
-			for (i = 0; i < vm_area->nr_pages; i++) {
-				struct page *page = vm_area->pages[i];
-				if (page_to_nid(page) != nid)
-					return false;
-			}
-		}
+	for (i = 0; i < NR_CACHED_STACKS; i++) {
+		struct vm_struct *tmp = NULL;
 
-		for (i = 0; i < NR_CACHED_STACKS; i++) {
-			struct vm_struct *tmp = NULL;
-
-			if (this_cpu_try_cmpxchg(cached_stacks[i], &tmp, vm_area))
-				return true;
-		}
+		if (this_cpu_try_cmpxchg(cached_stacks[i], &tmp, vm_area))
+			return true;
 	}
 	return false;
 }
@@ -330,9 +283,13 @@ static int alloc_thread_stack_node(struct task_struct *tsk, int node)
 {
 	struct vm_struct *vm_area;
 	void *stack;
+	int i;
 
-	vm_area = alloc_thread_stack_node_from_cache(tsk, node);
-	if (vm_area) {
+	for (i = 0; i < NR_CACHED_STACKS; i++) {
+		vm_area = this_cpu_xchg(cached_stacks[i], NULL);
+		if (!vm_area)
+			continue;
+
 		if (memcg_charge_kernel_stack(vm_area)) {
 			vfree(vm_area->addr);
 			return -ENOMEM;
@@ -896,13 +853,109 @@ int __weak arch_dup_task_struct(struct task_struct *dst,
 	*dst = *src;
 	return 0;
 }
+/*
+ * set_task_stack_end_magic - 태스크의 커널 스택 상단 경계에 매직 넘버를 기록한다
+ *
+ * 개요
+ * ----
+ * 각 task_struct는 "커널 스택(kernel stack)"을 하나씩 가진다.
+ * 커널 스택은 커널 모드(시스템 콜 처리, 인터럽트 핸들러, 스케줄러 등)에서만
+ * 사용되는 작은 고정 크기(보통 8KB 또는 16KB)의 스택 영역이다.
+ *
+ * 커널 스택은:
+ *   - 페이지 단위(THREAD_SIZE)로 할당되며
+ *   - "아래 방향(낮은 주소)"으로 자라는 구조를 가진다.
+ *
+ * 이 특성 때문에, 스택 페이지의 "상단(높은 주소) 일부"는
+ * 정상적인 스택 사용 중에는 절대 접근되지 않는 영역이 된다.
+ * 커널은 이 영역을 스택 오버플로우 감지용 "guard word"로 활용한다.
+ *
+ * end_of_stack()의 의미
+ * ---------------------
+ * end_of_stack(tsk)은 "이 task의 커널 스택 상단 경계에서 한 워드(unsigned long)
+ * 만큼 내려온 위치"를 반환한다. 이 위치는 커널이 설계 상 "스택 프레임이 절대
+ * 사용하지 않는 보호 구역"으로 간주하는 지점이다.
+ *
+ * end_of_stack()이 가리키는 정확한 레이아웃은 커널 설정에 따라 다를 수 있다:
+ *
+ *  (1) 전통적인 구조 (CONFIG_THREAD_INFO_IN_TASK 비활성)
+ *      - thread_info가 커널 스택의 최상단(높은 주소)에 함께 배치된다.
+ *      - end_of_stack(tsk)은 thread_info 바로 아래 한 워드를 가리킨다.
+ *
+ *          높은 주소
+ *          ┌───────────────────────┐
+ *          │   thread_info         │  ← 스택 상단 메타데이터
+ *          ├───────────────────────┤
+ *          │   STACK_END_MAGIC     │  ← end_of_stack(tsk)
+ *          ├───────────────────────┤
+ *          │   커널 스택 프레임들       │  (함수 호출, 지역 변수 등)
+ *          └───────────────────────┘
+ *          낮은 주소
+ *
+ *  (2) 최신 구조 (CONFIG_THREAD_INFO_IN_TASK = y)
+ *      - thread_info는 task_struct 내부에 포함되어 스택과 분리된다.
+ *      - 커널 스택 페이지는 "순수한 스택 전용 영역"이 되며,
+ *        end_of_stack(tsk)은 스택 페이지 최상단(높은 주소)의 한 워드를 가리킨다.
+ *
+ *          높은 주소 (스택 페이지 최상단)
+ *          ┌───────────────────────┐
+ *          │   STACK_END_MAGIC     │  ← end_of_stack(tsk)
+ *          ├───────────────────────┤
+ *          │   커널 스택 프레임들       │
+ *          └───────────────────────┘
+ *          낮은 주소
+ *
+ * 두 경우 모두 공통점은 다음과 같다:
+ *   - 커널 스택은 아래 방향으로 확장되므로, SP는 정상 동작 중 end_of_stack()
+ *     위치보다 높은 주소로 이동하지 않는다.
+ *   - end_of_stack()이 가리키는 워드는 "정상적인 스택 사용으로는 절대 덮어쓰지 않는"
+ *     안전한 보호 구역이다.
+ *
+ * STACK_END_MAGIC의 역할`
+ * ----------------------
+ * 이 함수는 end_of_stack(tsk)이 가리키는 워드에 STACK_END_MAGIC(예: 0x57AC6E9D)을
+ * 기록한다. 이 값의 의미는 다음과 같다:
+ *
+ *   - 정상적인 상황:
+ *       커널 스택 프레임은 end_of_stack() 아래(낮은 주소 방향)에서만 사용되므로
+ *       해당 위치의 값은 그대로 유지되어야 한다.
+ *
+ *   - 스택 오버플로우가 발생한 경우:
+ *       비정상적으로 깊은 콜 스택, 재귀, 버그 등으로 인해 SP가 허용된 범위를 벗어나
+ *       스택 상단 경계를 침범하면, end_of_stack()이 가리키는 워드가 다른 데이터로
+ *       덮어써질 수 있다.
+ *       이후 이 값을 검사했을 때 STACK_END_MAGIC이 아니면, 커널은 스택 오버플로우를
+ *       의심하거나 감지할 수 있다.
+ *
+ * 이 메커니즘은 다음과 같은 특성을 가진다:
+ *   - 매우 저비용: 단일 워드에 상수 값을 기록하는 것만으로 구현 가능하다.
+ *   - 완전한 보호 장치가 아니라 "경고 시스템"에 가깝다.
+ *       · 우연히 동일한 값이 다시 써질 확률(약 1/2^32)은 존재한다.
+ *       · 하지만 스택 오버플로우는 보통 크래시, 메모리 손상 등 다른 증상과 함께
+ *         나타나므로, 실질적인 디버깅/진단에 유용하다.
+ *
+ * 호출 시점과 의미
+ * ----------------
+ * set_task_stack_end_magic(tsk)는 보통 태스크의 커널 스택이 할당/초기화될 때
+ * 한 번 호출되어, 해당 스택 인스턴스의 상단 경계에 매직 넘버를 기록한다.
+ *
+ *   - tsk->stack      : 이 태스크의 커널 스택 베이스 주소 (낮은/높은 주소 방향은
+ *                       아키텍처/구현에 따라 다르나, THREAD_SIZE 단위로 할당됨)
+ *   - end_of_stack(tsk): 커널이 정의한 "이 스택의 상단 보호 워드" 주소
+ *   - *stackend       : 그 보호 워드에 기록되는 STACK_END_MAGIC 값
+ *
+ * 정리하면, 이 함수는:
+ *   - "이 task의 커널 스택에서 SP가 절대 닿지 말아야 할 상단 경계 지점"에
+ *   - 식별 가능한 특수 값을 기록함으로써
+ *   - 이후 스택 손상 여부를 간단히 검증할 수 있게 해준다.
+ */
 
-void set_task_stack_end_magic(struct task_struct *tsk)
+void set_task_stack_end_magic(struct task_struct *tsk) // include/linux/sched.h
 {
-	unsigned long *stackend;
+	unsigned long *stackend; // 커널이 할당한 스택의 끝을 가리키려는 변수
 
-	stackend = end_of_stack(tsk);
-	*stackend = STACK_END_MAGIC;	/* for overflow detection */
+	stackend = end_of_stack(tsk); // 스택 경계 주소 계산
+	*stackend = STACK_END_MAGIC;	/* for overflow detection */ //include/uapi/linux/magic.h 에 정의되어는 매크로, 커널이 할당한 슽택의 끝을 표시하는 값
 }
 
 static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
@@ -1101,10 +1154,10 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	if (current->mm) {
 		unsigned long flags = __mm_flags_get_word(current->mm);
 
-		__mm_flags_overwrite_word(mm, mmf_init_legacy_flags(flags));
+		__mm_flags_set_word(mm, mmf_init_legacy_flags(flags));
 		mm->def_flags = current->mm->def_flags & VM_INIT_DEF_MASK;
 	} else {
-		__mm_flags_overwrite_word(mm, default_dump_filter);
+		__mm_flags_set_word(mm, default_dump_filter);
 		mm->def_flags = 0;
 	}
 
