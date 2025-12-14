@@ -1007,6 +1007,7 @@ void start_kernel(void)
 	char *command_line;
 	char *after_dashes;
 
+	 // Stackoverflow 가 발생하는지 검증하기 위해 init_task 스택의 마지막에 매직 값을 넣어주고 그 값이 변조되었는지 확인하도록 함
 	set_task_stack_end_magic(&init_task);
 	smp_setup_processor_id();
 	debug_objects_early_init();
