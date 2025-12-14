@@ -1138,6 +1138,41 @@ void start_kernel(void) //시작
 	 * - init_task는 root 권한을 가짐 (init_cred: UID/GID 0, 모든 capability, init/init_task.c:71-90)
 	 */
 	set_task_stack_end_magic(&init_task);
+	/*
+	 * smp_setup_processor_id - 부팅 CPU의 프로세서 ID 설정 및 논리-물리 CPU 매핑 초기화
+	 *
+	 * 이 함수는 커널 부팅 초기 단계에서 호출되어 부팅 CPU의 물리적 식별자를 확인하고,
+	 * 논리적 CPU 번호와 물리적 CPU ID 간의 매핑을 설정합니다.
+	 *
+	 * 주요 작업:
+	 *   1. MPIDR 레지스터에서 부팅 CPU의 물리적 ID 읽기
+	 *   2. 논리적 CPU 0번과 물리적 CPU ID 간의 매핑 설정 (cpu_logical_map)
+	 *   3. 나머지 CPU들의 초기 매핑 설정
+	 *   4. Per-CPU 변수 접근을 위한 오프셋 초기화 (set_my_cpu_offset(0))
+	 *
+	 * 호출 시점:
+	 *   - start_kernel() 함수의 초기화 과정 중 매우 이른 단계에 호출됨
+	 *   - init_task 스택 매직 넘버 설정 직후
+	 *   - 디버그 객체 초기화 전
+	 *   - 인터럽트 비활성화 전
+	 *
+	 * 왜 이 시점에 필요한가:
+	 *   - 이후 초기화 코드들이 CPU 식별이 필요할 수 있음
+	 *   - Per-CPU 변수 접근이 가능해야 함 (lockdep 등)
+	 *   - SMP 관련 초기화를 위한 기반 설정
+	 *
+	 * 아키텍처별 구현:
+	 *   - ARM: arch/arm/kernel/setup.c:611
+	 *   - ARM64: arch/arm64/kernel/setup.c:90
+	 *   - RISC-V: arch/riscv/kernel/smp.c:59
+	 *   - x86: 기본 구현 없음 (다른 방식으로 처리)
+	 *   - 기본 (weak): init/main.c:799 (빈 함수)
+	 *
+	 * 참고:
+	 *   - 이 함수는 아키텍처별로 다른 구현을 가질 수 있음 (__weak로 선언됨)
+	 *   - 링커가 아키텍처별 구현을 찾으면 그것을 사용하고, 없으면 기본 구현 사용
+	 *   - SMP 시스템에서만 의미가 있으며, UP 시스템에서는 대부분 빈 구현
+	 */
 	smp_setup_processor_id();
 	debug_objects_early_init();
 	init_vmlinux_build_id();

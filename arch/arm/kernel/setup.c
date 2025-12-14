@@ -593,23 +593,168 @@ void notrace cpu_init(void)
 
 u32 __cpu_logical_map[NR_CPUS] = { [0 ... NR_CPUS-1] = MPIDR_INVALID };
 
+/**
+ * smp_setup_processor_id - 부팅 CPU의 프로세서 ID를 설정하고 논리-물리 CPU 매핑 초기화
+ *
+ * 이 함수는 커널 부팅 초기 단계에서 호출되어 부팅 CPU의 물리적 식별자(MPIDR)를 읽고,
+ * 논리적 CPU 번호와 물리적 CPU ID 간의 매핑을 설정합니다.
+ *
+ * 주요 작업:
+ * 1. MPIDR 레지스터에서 부팅 CPU의 물리적 ID 읽기
+ * 2. 논리적 CPU 0번과 물리적 CPU ID 간의 매핑 설정
+ * 3. 나머지 CPU들의 초기 매핑 설정
+ * 4. Per-CPU 변수 접근을 위한 오프셋 초기화
+ *
+ * 호출 시점: init/main.c의 start_kernel()에서 초기화 과정 중 호출됨
+ * 아키텍처: ARM 전용 구현 (다른 아키텍처는 각자의 구현 사용)
+ */
 void __init smp_setup_processor_id(void)
 {
 	int i;
+	/*
+	 * mpidr: Multiprocessor Affinity Register 값
+	 *
+	 * SMP (Symmetric Multi-Processing) 시스템:
+	 *   - 여러 CPU가 동등한 권한으로 메모리와 I/O를 공유하며 동작하는 멀티프로세서 시스템
+	 *   - 모든 CPU가 동일한 역할을 수행 (마스터/슬레이브 구분 없음)
+	 *   - 모든 CPU가 커널 코드 실행 및 인터럽트 처리 가능
+	 *   - 공유 메모리 아키텍처 사용
+	 *   - 예: 듀얼코어, 쿼드코어 프로세서 등
+	 *
+	 * - SMP 시스템인 경우: CP15의 MPIDR 레지스터를 읽어 하드웨어 ID 비트만 추출 (비트 23:0)
+	 *   각 CPU는 고유한 MPIDR 값을 가지므로, 이를 통해 CPU를 식별할 수 있습니다.
+	 * - 단일 CPU 시스템인 경우: 0으로 설정
+	 *   UP(Uni-Processor) 시스템에서는 CPU 식별이 불필요하므로 0을 사용합니다.
+	 *
+	 * MPIDR_HWID_BITMASK (0xFFFFFF)는 하위 24비트만 추출하여
+	 * SMP 비트(31:30)와 MT 비트(24)를 제외한 실제 하드웨어 ID만 얻습니다.
+	 *
+	 * 예시: MPIDR = 0x80000002 (SMP=1, MT=0, HWID=2)인 경우
+	 *       mpidr = 0x00000002
+	 *
+	 * 호출 함수 위치:
+	 * - is_smp(): arch/arm/include/asm/smp_plat.h:18
+	 * - read_cpuid_mpidr(): arch/arm/include/asm/cputype.h:260
+	 * - MPIDR_HWID_BITMASK: arch/arm/include/asm/cputype.h:54
+	 */
 	u32 mpidr = is_smp() ? read_cpuid_mpidr() & MPIDR_HWID_BITMASK : 0;
+
+	/*
+	 * cpu: Affinity Level 0 값 (비트 7:0)
+	 * - 멀티스레딩이 활성화된 경우: CPU 코어 내 스레드 ID
+	 * - 멀티스레딩이 비활성화된 경우: 코어 ID
+	 *
+	 * MPIDR_AFFINITY_LEVEL 매크로는 MPIDR의 특정 레벨(0, 1, 2)에서
+	 * 8비트씩 추출합니다.
+	 *
+	 * 예시: mpidr = 0x00000102 (클러스터=1, 코어=0, 스레드=2)인 경우
+	 *       cpu = 2 (Level 0, 즉 스레드 ID)
+	 *
+	 * 매크로 위치:
+	 * - MPIDR_AFFINITY_LEVEL: arch/arm/include/asm/cputype.h:62
+	 */
 	u32 cpu = MPIDR_AFFINITY_LEVEL(mpidr, 0);
 
+	/*
+	 * 논리적 CPU 0번(부팅 CPU)의 물리적 ID 매핑 설정
+	 *
+	 * cpu_logical_map[0] = cpu 의미:
+	 * - 커널 내부에서 논리적 CPU 0번으로 참조하는 CPU의 물리적 ID가 'cpu'임을 설정
+	 *
+	 * 예시: 물리적 CPU 2가 부팅 CPU인 경우
+	 *       cpu_logical_map[0] = 2
+	 *       즉, "논리적 CPU 0 = 물리적 CPU 2"
+	 *
+	 * 매크로/변수 위치:
+	 * - cpu_logical_map: arch/arm/include/asm/smp_plat.h:73 (매크로)
+	 * - __cpu_logical_map: arch/arm/kernel/setup.c:594 (배열 정의)
+	 */
 	cpu_logical_map(0) = cpu;
+
+	/*
+	 * 나머지 논리적 CPU들의 초기 매핑 설정
+	 *
+	 * 매핑 규칙:
+	 * - 논리적 CPU i의 물리적 ID가 'cpu'와 같으면 → 물리적 ID 0으로 매핑
+	 *   (이렇게 하면 물리적 CPU 0번이 다른 논리적 CPU 번호를 가질 수 있음)
+	 * - 그 외의 경우 → 논리적 번호와 동일한 물리적 ID로 매핑
+	 *
+	 * 예시: 물리적 CPU 2가 부팅 CPU인 경우
+	 *       cpu_logical_map[0] = 2  (이미 설정됨)
+	 *       cpu_logical_map[1] = 1  (1 != 2이므로 1)
+	 *       cpu_logical_map[2] = 0  (2 == 2이므로 0으로 매핑)
+	 *       cpu_logical_map[3] = 3  (3 != 2이므로 3)
+	 *
+	 * 이 매핑은 초기값이며, 실제 시스템 토폴로지가 파악되면
+	 * Device Tree나 ACPI 정보를 기반으로 재설정될 수 있습니다.
+	 */
 	for (i = 1; i < nr_cpu_ids; ++i)
 		cpu_logical_map(i) = i == cpu ? 0 : i;
 
 	/*
-	 * clear __my_cpu_offset on boot CPU to avoid hang caused by
-	 * using percpu variable early, for example, lockdep will
-	 * access percpu variable inside lock_release
+	 * 부팅 CPU의 Per-CPU 변수 오프셋을 0으로 초기화
+	 *
+	 * CPU Offset (CPU 오프셋)의 역할:
+	 *   CPU offset은 SMP 시스템에서 각 CPU가 자신의 Per-CPU 변수에 접근하기 위해
+	 *   사용하는 메모리 오프셋 값입니다.
+	 *
+	 *   Per-CPU 변수란:
+	 *     - 각 CPU마다 독립적인 인스턴스를 가지는 변수
+	 *     - CPU 간 동기화 없이 빠르게 접근 가능
+	 *     - 예: DEFINE_PER_CPU(int, counter)는 각 CPU마다 별도의 counter를 가짐
+	 *
+	 *   동작 원리:
+	 *     1. 메모리에 Per-CPU 변수들이 연속적으로 배치됨
+	 *        [CPU0 영역][CPU1 영역][CPU2 영역]...
+	 *     2. 각 CPU는 자신의 오프셋을 알고 있음
+	 *        CPU0: offset = 0
+	 *        CPU1: offset = CPU0 영역 크기
+	 *        CPU2: offset = CPU0 영역 크기 + CPU1 영역 크기
+	 *     3. Per-CPU 변수 접근 시: base_address + offset + 변수_오프셋
+	 *
+	 *   예시:
+	 *     DEFINE_PER_CPU(int, my_var);
+	 *     CPU0에서 접근: my_var = base + 0 + my_var_offset
+	 *     CPU1에서 접근: my_var = base + cpu1_offset + my_var_offset
+	 *
+	 *   ARM 아키텍처에서의 구현:
+	 *     - __my_cpu_offset는 각 CPU가 자신의 Per-CPU 변수에 접근하기 위해
+	 *       사용하는 오프셋 값입니다.
+	 *     - 이 값은 TPIDRPRW (Thread ID, Privileged Read/Write) 레지스터에 저장됩니다.
+	 *     - TPIDRPRW는 ARMv6K 이상에서만 사용 가능하며, 각 CPU가 독립적으로
+	 *       자신의 값을 유지할 수 있습니다.
+	 *
+	 * 초기화가 필요한 이유:
+	 *   - 부팅 단계에서는 아직 Per-CPU 영역이 완전히 설정되지 않았을 수 있음
+	 *   - 초기 부팅 중 Per-CPU 변수 접근 시 잘못된 오프셋으로 인한 hang 방지
+	 *   - lockdep 같은 초기화 코드가 Per-CPU 변수에 접근할 수 있음
+	 *
+	 * set_my_cpu_offset(0)의 의미:
+	 *   - 부팅 CPU의 오프셋을 0으로 설정
+	 *   - Per-CPU 변수가 아직 설정되지 않은 상태에서도 안전하게 접근 가능
+	 *   - 부팅 CPU는 항상 첫 번째 Per-CPU 영역을 사용하므로 offset = 0이 적절함
+	 *
+	 * 참고:
+	 *   - 이후 smp_prepare_boot_cpu() 등에서 실제 Per-CPU 오프셋이 설정됩니다.
+	 *   - 다른 CPU들은 부팅 시 각자의 오프셋이 설정됩니다.
+	 *
+	 * 함수 위치:
+	 *   - set_my_cpu_offset(): arch/arm/include/asm/percpu.h:17 (CONFIG_SMP인 경우)
+	 *                          arch/arm/include/asm/percpu.h:64 (비SMP인 경우, 빈 매크로)
 	 */
 	set_my_cpu_offset(0);
 
+	/*
+	 * 부팅 정보 출력
+	 *
+	 * 어떤 물리적 CPU에서 부팅되었는지 로그로 출력합니다.
+	 * 이 정보는 디버깅과 시스템 분석에 유용합니다.
+	 *
+	 * 예시 출력: "Booting Linux on physical CPU 0x2"
+	 *
+	 * 매크로 위치:
+	 * - pr_info(): include/linux/printk.h (로그 출력 매크로)
+	 */
 	pr_info("Booting Linux on physical CPU 0x%x\n", mpidr);
 }
 
