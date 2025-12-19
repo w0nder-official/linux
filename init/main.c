@@ -1161,6 +1161,21 @@ void start_kernel(void) //시작
 	 *   - Per-CPU 변수 접근이 가능해야 함 (lockdep 등)
 	 *   - SMP 관련 초기화를 위한 기반 설정
 	 *
+	 * SMP (Symmetric Multi-Processing, 대칭형 멀티프로세싱)란:
+	 *   - 여러 CPU가 동등한 권한으로 메모리와 I/O를 공유하며 동작하는
+	 *     멀티프로세서 시스템
+	 *   - 모든 CPU가 동일한 역할을 수행 (마스터/슬레이브 구분 없음)
+	 *   - 모든 CPU가 커널 코드 실행 및 인터럽트 처리 가능
+	 *   - 공유 메모리 아키텍처 사용
+	 *   - 예: 듀얼코어, 쿼드코어, 옥타코어 프로세서 등
+	 *
+	 * UP vs SMP:
+	 *   - UP (Uni-Processor): 단일 CPU 시스템
+	 *   - SMP: 다중 CPU 시스템
+	 *   - CONFIG_SMP 옵션으로 활성화/비활성화 가능
+	 *   - SMP 비활성화 시: 다중 CPU 시스템에서도 하나의 CPU만 사용
+	 *   - SMP 활성화 시: 다중 CPU 시스템에서 모든 CPU 활용
+	 *
 	 * 아키텍처별 구현:
 	 *   - ARM: arch/arm/kernel/setup.c:611
 	 *   - ARM64: arch/arm64/kernel/setup.c:90
@@ -1174,6 +1189,35 @@ void start_kernel(void) //시작
 	 *   - SMP 시스템에서만 의미가 있으며, UP 시스템에서는 대부분 빈 구현
 	 */
 	smp_setup_processor_id();
+	/*
+	 * debug_objects_early_init() - 디버그 객체 추적 시스템 초기화
+	 *
+	 * 구현 위치: lib/debugobjects.c:1412
+	 *
+	 * 기능:
+	 *   - 디버그 객체 추적 시스템의 해시 버킷 초기화
+	 *   - 정적 객체 풀의 객체들을 부팅 리스트에 연결
+	 *   - 이 함수 호출 후 객체 추적 시스템이 완전히 동작 가능한 상태가 됨
+	 *
+	 * 주요 작업:
+	 *   1. ODEBUG_HASH_SIZE만큼의 해시 버킷에 대해 raw_spin_lock 초기화
+	 *   2. ODEBUG_POOL_SIZE만큼의 정적 객체 풀 객체들을 pool_boot 리스트에 추가
+	 *
+	 * 디버그 객체 추적 시스템이란:
+	 *   - 커널 객체(스핀락, 타이머, RCU 등)의 생명주기를 추적하는 디버깅 도구
+	 *   - 객체의 초기화, 활성화, 비활성화, 파괴 등의 상태를 모니터링
+	 *   - 이중 초기화, 사용 후 해제 등의 버그를 감지
+	 *   - CONFIG_DEBUG_OBJECTS 옵션으로 활성화/비활성화 가능
+	 *
+	 * 호출 시점:
+	 *   - smp_setup_processor_id() 직후
+	 *   - init_vmlinux_build_id() 전
+	 *   - 매우 이른 부팅 단계에서 호출됨 (인터럽트 비활성화 전)
+	 *
+	 * 참고:
+	 *   - 헤더: include/linux/debugobjects.h:89
+	 *   - 문서: Documentation/core-api/debug-objects.rst
+	 */
 	debug_objects_early_init();
 	init_vmlinux_build_id();
 

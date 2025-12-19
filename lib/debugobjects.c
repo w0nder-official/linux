@@ -19,8 +19,24 @@
 #include <linux/slab.h>
 #include <linux/static_key.h>
 
-#define ODEBUG_HASH_BITS	14
-#define ODEBUG_HASH_SIZE	(1 << ODEBUG_HASH_BITS)
+/* 디버그 객체 해시 테이블 크기 정의
+ * ODEBUG_HASH_BITS: 해시 테이블 크기를 결정하는 비트 수 (14비트)
+ * ODEBUG_HASH_SIZE: 실제 해시 테이블 크기 = 2^14 = 16,384개 버킷
+ *
+ * 이 값은 코드에서 하드코딩된 상수로, 개발자가 직접 정한 값입니다.
+ * Kconfig 옵션이나 사용자 설정이 아닌, 컴파일 타임에 고정된 값입니다.
+ *
+ * 해시 테이블 크기 선택 이유:
+ *   - 너무 작으면: 해시 충돌이 많아져 성능 저하
+ *   - 너무 크면: 메모리 낭비 (각 버킷마다 락과 리스트 헤드 필요)
+ *   - 2^14 = 16K는 일반적인 커널 객체 수에 적합한 균형점
+ *
+ * 사용 위치:
+ *   - obj_hash[ODEBUG_HASH_SIZE]: 해시 테이블 배열 선언 (70번 줄)
+ *   - debug_objects_early_init(): 모든 버킷의 락 초기화 (1423번 줄)
+ */
+#define ODEBUG_HASH_BITS	14	/* 해시 테이블 크기 비트 수 */
+#define ODEBUG_HASH_SIZE	(1 << ODEBUG_HASH_BITS)	/* 해시 테이블 크기 = 2^14 = 16384 */
 
 /* Must be power of two */
 #define ODEBUG_BATCH_SIZE	16
@@ -1405,19 +1421,287 @@ static inline bool debug_objects_selftest(void) { return true; }
 #endif
 
 /*
- * Called during early boot to initialize the hash buckets and link
- * the static object pool objects into the poll list. After this call
- * the object tracker is fully operational.
+ * debug_objects_early_init - 디버그 객체 추적 시스템 초기화
+ *
+ * 이 함수는 부팅 초기 단계에서 호출되어 해시 버킷을 초기화하고
+ * 정적 객체 풀의 객체들을 부팅 리스트에 연결합니다.
+ * 이 함수 호출 후 객체 추적 시스템이 완전히 동작 가능한 상태가 됩니다.
  */
 void __init debug_objects_early_init(void)
 {
-	int i;
+	int i;	/* 반복문 인덱스 변수 */
 
+	/* 해시 테이블의 모든 버킷에 락(자물쇠) 설정
+	 *
+	 * 해시 테이블이란:
+	 *   - 객체를 빠르게 찾기 위한 자료구조
+	 *   - 객체의 주소를 해시 함수로 계산하여 특정 버킷(상자)에 저장
+	 *   - 예: 16,384개의 상자가 있고, 각 상자에 여러 객체를 넣을 수 있음
+	 *
+	 * 해시 버킷이란:
+	 *   - 해시 테이블의 각 상자(슬롯)를 의미
+	 *   - obj_hash[0], obj_hash[1], ..., obj_hash[16383]까지 총 16,384개
+	 *   - 각 버킷은 구조체로, 객체 리스트와 락을 포함:
+	 *     struct debug_bucket {
+	 *         struct hlist_head list;  // 이 버킷에 속한 객체들의 리스트
+	 *         raw_spinlock_t lock;     // 이 버킷을 보호하는 자물쇠
+	 *     }
+	 *
+	 * 해시 버킷을 왜 만드는가:
+	 *   1. 빠른 객체 검색: 객체 주소를 해시 함수로 계산하여 O(1) 시간에 버킷 찾기
+	 *   2. 분산 저장: 모든 객체를 하나의 리스트에 넣지 않고 16K개 버킷으로 분산
+	 *   3. 병렬 처리: 다른 버킷은 동시에 접근 가능 (버킷별 독립 락)
+	 *   4. 메모리 효율: 전체 객체를 순회하지 않고 특정 버킷만 검색
+	 *
+	 * 실제 사용 방법:
+	 *   1. 객체 주소로 버킷 결정:
+	 *      db = get_bucket((unsigned long) addr);
+	 *      → 객체 주소를 해시 함수로 계산하여 0~16383 사이의 버킷 번호 결정
+	 *
+	 *   2. 버킷의 락 획득:
+	 *      raw_spin_lock_irqsave(&db->lock, flags);
+	 *      → 해당 버킷을 사용하기 전에 락 획득 (다른 CPU 접근 차단)
+	 *
+	 *   3. 버킷의 리스트에서 객체 찾기:
+	 *      obj = lookup_object(addr, db);
+	 *      → 버킷의 리스트를 순회하여 해당 주소의 객체 검색
+	 *
+	 *   4. 객체 추가/삭제:
+	 *      hlist_add_head(&obj->node, &db->list);  // 버킷 리스트에 추가
+	 *      hlist_del(&obj->node);                   // 버킷 리스트에서 삭제
+	 *
+	 *   5. 락 해제:
+	 *      raw_spin_unlock_irqrestore(&db->lock, flags);
+	 *
+	 * 사용 예시 (__debug_object_init 함수에서):
+	 *   void *addr = 0xffff800012345678;  // 추적할 객체의 주소
+	 *
+	 *   // 1. 객체 주소로 버킷 결정 (예: 버킷 1234)
+	 *   db = get_bucket((unsigned long) addr);
+	 *
+	 *   // 2. 버킷의 락 획득
+	 *   raw_spin_lock_irqsave(&db->lock, flags);
+	 *
+	 *   // 3. 버킷의 리스트에서 객체 찾기
+	 *   obj = lookup_object(addr, db);
+	 *
+	 *   // 4. 객체가 없으면 새로 할당하여 버킷에 추가
+	 *   if (!obj) {
+	 *       obj = alloc_object(addr, db, descr);
+	 *       hlist_add_head(&obj->node, &db->list);
+	 *   }
+	 *
+	 *   // 5. 락 해제
+	 *   raw_spin_unlock_irqrestore(&db->lock, flags);
+	 *
+	 * 해시 함수 동작:
+	 *   - 객체 주소를 페이지 단위로 나누어 해시 계산
+	 *   - 같은 페이지의 객체들은 같은 버킷에 저장될 가능성이 높음
+	 *   - 해제된 객체를 확인할 때 해당 버킷만 검사하면 됨
+	 *
+	 * 디버그 용도로 해시가 어떻게 사용되는가:
+	 *   디버그 객체 시스템은 커널 객체의 생명주기를 추적하여 프로그래밍 버그를 감지합니다.
+	 *   해시 테이블은 이 추적 정보를 효율적으로 저장하고 검색하는 핵심 자료구조입니다.
+	 *
+	 *   1. 객체 주소를 키로 사용한 추적 정보 저장:
+	 *      - 각 커널 객체(스핀락, 타이머, work_struct 등)의 주소를 키로 사용
+	 *      - 해시 함수(get_bucket)로 객체 주소 → 버킷 번호 변환
+	 *      - 해당 버킷의 리스트에 debug_obj 구조체 저장
+	 *        struct debug_obj {
+	 *            void *object;              // 추적 중인 객체의 주소 (키)
+	 *            enum debug_obj_state state; // 객체의 현재 상태
+	 *            struct debug_obj_descr *descr; // 객체 타입 정보
+	 *        }
+	 *
+	 *   2. 객체 생명주기 상태 머신 추적:
+	 *      - NONE → INIT → ACTIVE → DESTROYED/FREE 상태 전이 추적
+	 *      - 각 상태 전이 시점(init, activate, destroy, free)에 해시 테이블 검색
+	 *      - 예: debug_object_init() 호출 시
+	 *        → get_bucket(addr)로 버킷 찾기
+	 *        → lookup_object(addr, db)로 기존 추적 정보 검색
+	 *        → 상태 검증 및 업데이트
+	 *
+	 *   3. 버그 감지 메커니즘:
+	 *      a) Double Init (중복 초기화) 감지:
+	 *         - 이미 INIT 상태인 객체를 다시 init 시도 → 경고
+	 *         - 해시 테이블에서 기존 상태 확인하여 감지
+	 *
+	 *      b) Use-After-Free (해제 후 사용) 감지:
+	 *         - FREE/DESTROYED 상태인 객체를 activate/use 시도 → 경고
+	 *         - 해시 테이블에서 객체 상태 확인하여 감지
+	 *
+	 *      c) Double Free (중복 해제) 감지:
+	 *         - 이미 FREE 상태인 객체를 다시 free 시도 → 경고
+	 *         - 해시 테이블에서 상태 확인하여 감지
+	 *
+	 *      d) 초기화 누락 감지:
+	 *         - debug_object_assert_init() 호출 시 해시 테이블 검색
+	 *         - 객체가 추적되지 않으면 초기화되지 않은 것으로 판단
+	 *
+	 *   4. 해시를 사용하는 이유 (성능 및 동시성):
+	 *      a) 빠른 검색 성능:
+	 *         - 객체 주소로 O(1) 시간에 버킷 찾기
+	 *         - 전체 객체를 순회하지 않고 특정 버킷만 검색
+	 *         - 16K개 버킷으로 분산하여 충돌 최소화
+	 *
+	 *      b) 동시성 제어:
+	 *         - 각 버킷마다 독립적인 락 보유
+	 *         - 다른 버킷은 동시에 접근 가능 (병렬 처리)
+	 *         - 같은 버킷만 락으로 보호 (경합 최소화)
+	 *
+	 *      c) 메모리 효율성:
+	 *         - 페이지 단위 해시로 같은 페이지 객체들을 같은 버킷에 저장
+	 *         - 페이지 해제 시 해당 버킷만 검사하여 추적 객체 정리 가능
+	 *
+	 *   5. 실제 디버깅 시나리오 예시:
+	 *      시나리오: 스핀락을 두 번 초기화하는 버그
+	 *
+	 *      // 첫 번째 초기화
+	 *      raw_spinlock_t lock;
+	 *      raw_spin_lock_init(&lock);
+	 *      → debug_object_init(&lock, &spinlock_debug_descr) 호출
+	 *      → get_bucket((unsigned long)&lock) → 버킷 1234 결정
+	 *      → 버킷 1234의 리스트에 debug_obj 추가 (state = INIT)
+	 *
+	 *      // 두 번째 초기화 (버그!)
+	 *      raw_spin_lock_init(&lock);  // 잘못된 코드
+	 *      → debug_object_init(&lock, &spinlock_debug_descr) 호출
+	 *      → get_bucket((unsigned long)&lock) → 버킷 1234 결정
+	 *      → lookup_object(&lock, db) → 기존 debug_obj 발견
+	 *      → 상태 확인: 이미 INIT 상태
+	 *      → 경고 출력: "ODEBUG: init of active object"
+	 *      → 커널 로그에 버그 위치와 스택 트레이스 출력
+	 *
+	 *   6. 해시 함수 상세 동작:
+	 *      static struct debug_bucket *get_bucket(unsigned long addr)
+	 *      {
+	 *          unsigned long hash;
+	 *          // 객체 주소를 페이지 단위(4KB)로 나누어 해시 계산
+	 *          hash = hash_long((addr >> ODEBUG_CHUNK_SHIFT), ODEBUG_HASH_BITS);
+	 *          // 0 ~ 16383 사이의 버킷 번호 반환
+	 *          return &obj_hash[hash];
+	 *      }
+	 *
+	 *      - 같은 페이지의 객체들은 같은 버킷에 저장됨
+	 *      - 페이지 해제 시 해당 버킷만 순회하여 추적 객체 정리 가능
+	 *      - 해시 충돌 시 버킷 내 리스트로 해결 (체이닝)
+	 *
+	 *   7. 객체 추적의 실제 동작 방식 (핵심 개념):
+	 *      "추적하고 싶은 객체를 여기에 넣어서 확인하는거야?"
+	 *      → 네, 맞습니다! 하지만 정확히는:
+	 *
+	 *      a) 실제 객체는 그대로 두고, 별도의 추적 정보를 해시 테이블에 저장:
+	 *         - 실제 커널 객체 (예: raw_spinlock_t lock)는 원래 위치에 그대로 존재
+	 *         - 해시 테이블에는 별도의 debug_obj 구조체를 저장
+	 *         - debug_obj는 객체의 주소만 저장 (obj->object = &lock)
+	 *
+	 *      b) 객체 등록 과정 (debug_object_init 호출 시):
+	 *         1. 객체 주소로 버킷 찾기: get_bucket((unsigned long)&lock)
+	 *         2. 버킷의 리스트에서 기존 추적 정보 검색: lookup_object(&lock, db)
+	 *         3. 없으면 새 debug_obj 할당: alloc_object(&lock, db, descr)
+	 *         4. debug_obj 구조체 초기화:
+	 *            obj->object = &lock;        // 추적할 객체의 주소 저장
+	 *            obj->state = ODEBUG_STATE_INIT;  // 상태를 INIT으로 설정
+	 *            obj->descr = &spinlock_debug_descr;  // 객체 타입 정보 저장
+	 *         5. 버킷의 리스트에 추가: hlist_add_head(&obj->node, &db->list)
+	 *
+	 *      c) 객체 생명주기 이벤트마다 해시 테이블 검색:
+	 *         - init:   debug_object_init(&lock, descr) 호출
+	 *                   → 해시 테이블에서 &lock 주소로 debug_obj 찾기
+	 *                   → 상태가 이미 INIT이면 "double init" 경고
+	 *
+	 *         - activate: debug_object_activate(&lock, descr) 호출
+	 *                    → 해시 테이블에서 &lock 주소로 debug_obj 찾기
+	 *                    → 상태가 FREE면 "use-after-free" 경고
+	 *
+	 *         - free:   debug_object_free(&lock, descr) 호출
+	 *                  → 해시 테이블에서 &lock 주소로 debug_obj 찾기
+	 *                  → 상태가 이미 FREE면 "double free" 경고
+	 *                  → 정상이면 debug_obj를 리스트에서 제거하고 해제
+	 *
+	 *      d) 메모리 구조 예시:
+	 *         실제 객체:
+	 *           메모리 주소 0xffff800012345678: raw_spinlock_t lock = { ... }
+	 *
+	 *         해시 테이블 (버킷 1234):
+	 *           obj_hash[1234].list → [debug_obj1] → [debug_obj2] → NULL
+	 *                                 ↓
+	 *                         debug_obj1 {
+	 *                             .object = 0xffff800012345678,  // lock의 주소
+	 *                             .state = ODEBUG_STATE_INIT,
+	 *                             .descr = &spinlock_debug_descr,
+	 *                             .node = { ... }
+	 *                         }
+	 *
+	 *      e) 왜 이렇게 설계했나:
+	 *         - 실제 객체를 수정하지 않고 추적 가능 (비침투적)
+	 *         - 객체의 메모리 레이아웃에 영향 없음
+	 *         - 디버그 모드가 꺼져있어도 성능 영향 없음
+	 *         - 객체 주소만 알면 즉시 추적 정보 검색 가능 (O(1))
+	 *
+	 *      f) 요약:
+	 *         "추적하고 싶은 객체를 해시 테이블에 등록하고,
+	 *          객체의 생명주기 이벤트(init/activate/destroy/free)마다
+	 *          해시 테이블을 검색하여 상태를 확인하고 버그를 감지합니다."
+	 *
+	 * 락(lock)이란:
+	 *   - 여러 CPU나 스레드가 동시에 같은 버킷에 접근하는 것을 방지하는 자물쇠
+	 *   - 한 CPU가 버킷을 사용 중이면 다른 CPU는 대기해야 함
+	 *   - 데이터 무결성 보장 (동시 수정으로 인한 데이터 손상 방지)
+	 *
+	 * 초기화란:
+	 *   - 락을 사용 가능한 상태로 준비시키는 것
+	 *   - 락의 내부 상태를 "잠금 해제됨" 상태로 설정
+	 *
+	 * 왜 필요한가:
+	 *   - SMP 시스템에서 여러 CPU가 동시에 같은 버킷에 객체를 추가/삭제할 수 있음
+	 *   - 락이 없으면 데이터 손상이나 시스템 크래시 발생 가능
+	 *   - 각 버킷마다 독립적인 락을 두어 동시성 제어
+	 *
+	 * 예시:
+	 *   - CPU 0이 버킷[100]에 객체 추가 시도 → 락 획득 → 객체 추가 → 락 해제
+	 *   - CPU 1이 동시에 버킷[100]에 객체 추가 시도 → 락 대기 → CPU 0 완료 후 락 획득 → 객체 추가
+	 */
 	for (i = 0; i < ODEBUG_HASH_SIZE; i++)
+		/* i번째 해시 버킷의 락을 초기화
+		 * obj_hash[i]는 i번째 버킷이고, 그 안의 lock 필드를 초기화합니다.
+		 * 초기화 후 이 락은 사용할 준비가 된 상태입니다.
+		 */
 		raw_spin_lock_init(&obj_hash[i].lock);
 
-	/* Keep early boot simple and add everything to the boot list */
+	/* 정적 객체 풀의 모든 객체를 부팅 리스트에 추가
+	 * 부팅 단계를 단순하게 유지하기 위해 모든 정적 객체를 부팅 리스트에 추가합니다.
+	 * ODEBUG_POOL_SIZE만큼의 정적 객체 풀 객체들을 pool_boot 리스트에 연결합니다.
+	 * 이 객체들은 나중에 동적으로 할당된 객체로 대체될 수 있습니다.
+	 */
 	for (i = 0; i < ODEBUG_POOL_SIZE; i++)
+		/* hlist_add_head() - 해시 리스트의 헤드에 새 노드 추가
+		 * 구현 위치: include/linux/list.h:1033
+		 *
+		 * 기능:
+		 *   - 새로운 노드를 해시 리스트의 맨 앞(헤드)에 추가합니다
+		 *   - 스택 구조를 구현하는 데 적합합니다 (LIFO: Last In First Out)
+		 *
+		 * 파라미터:
+		 *   @n: 추가할 새 노드 (obj_static_pool[i].node)
+		 *   @h: 해시 리스트의 헤드 (pool_boot)
+		 *
+		 * 동작 과정:
+		 *   1. 현재 헤드의 첫 번째 노드를 임시 변수에 저장
+		 *   2. 새 노드의 next를 현재 첫 번째 노드로 설정
+		 *   3. 기존 첫 번째 노드가 있으면, 그 노드의 pprev를 새 노드의 next 포인터로 설정
+		 *   4. 헤드의 first를 새 노드로 변경
+		 *   5. 새 노드의 pprev를 헤드의 first 포인터로 설정
+		 *
+		 * 결과:
+		 *   - 새 노드가 리스트의 맨 앞에 추가됨
+		 *   - 기존 노드들은 새 노드 뒤로 밀려남
+		 *
+		 * 사용 예시:
+		 *   - 해시 테이블에 객체 추가
+		 *   - 스택 구조 구현
+		 *   - 부팅 단계의 정적 객체 풀 초기화 (현재 사용)
+		 */
 		hlist_add_head(&obj_static_pool[i].node, &pool_boot);
 }
 

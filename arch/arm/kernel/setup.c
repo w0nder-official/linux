@@ -614,6 +614,56 @@ void __init smp_setup_processor_id(void)
 	/*
 	 * mpidr: Multiprocessor Affinity Register 값
 	 *
+	 * MPIDR 약자:
+	 *   - M = Multiprocessor (멀티프로세서)
+	 *   - PID = Processor ID (프로세서 식별자)
+	 *   - R = Register (레지스터)
+	 *   정식 명칭: Multiprocessor Affinity Register
+	 *   ARM 아키텍처에서 각 CPU 코어의 고유 식별자와 어피니티 레벨 정보를 담는 레지스터
+	 *
+	 * 레지스터(Register)란:
+	 *   - 레지스터는 메모리가 아닌 CPU 내부에 있는 고속 저장 공간입니다
+	 *   - CPU가 직접 접근하는 가장 빠른 저장소로, 메모리 계층 구조의 최상위에 위치
+	 *   - 물리적으로 CPU 칩 내부에 구현되어 있어 메모리(RAM)와는 완전히 다른 공간
+	 *   - 용량은 매우 작지만(보통 수십~수백 바이트) 접근 속도가 매우 빠름 (1 사이클)
+	 *   - 메모리 접근은 수백~수천 사이클이 걸리지만, 레지스터 접근은 1 사이클
+	 *   - 레지스터는 CPU의 연산, 제어, 상태 저장 등에 사용됨
+	 *   - 예: 범용 레지스터(r0-r15), 상태 레지스터, 제어 레지스터 등
+	 *   - MPIDR은 CP15(시스템 제어 코프로세서)의 제어 레지스터 중 하나
+	 *
+	 * 제어 레지스터(Control Register)란:
+	 *   - CPU의 동작을 제어하고 상태를 관리하는 특수 레지스터
+	 *   - 범용 레지스터와 달리 특정 기능을 담당하는 전용 레지스터
+	 *   - CP15 (Coprocessor 15): ARM의 시스템 제어 코프로세서
+	 *     * MMU(Memory Management Unit) 제어
+	 *     * 캐시 제어
+	 *     * 인터럽트 제어
+	 *     * CPU 식별 정보 (MPIDR 포함)
+	 *     * 보안 및 권한 관리
+	 *   - 제어 레지스터는 특수 어셈블리 명령어로만 접근 가능
+	 *     * MRC (Move to Register from Coprocessor): 레지스터 읽기
+	 *     * MCR (Move to Coprocessor from Register): 레지스터 쓰기
+	 *   - 예: MMU 제어 레지스터, 캐시 제어 레지스터, MPIDR 등
+	 *
+	 * MPIDR 동작 방식:
+	 *   - 읽기 전용 레지스터: 하드웨어가 부팅 시 자동으로 설정
+	 *   - 각 CPU 코어마다 고유한 값: 하드웨어 설계 시 할당됨
+	 *   - 어피니티 레벨(Affinity Level) 구조:
+	 *     * Level 0 (비트 7:0):   CPU 코어 내 스레드 ID 또는 코어 ID
+	 *     * Level 1 (비트 15:8):  클러스터 ID
+	 *     * Level 2 (비트 23:16): 소켓/패키지 ID
+	 *   - 비트 구성:
+	 *     * 비트 31:30: SMP 모드 비트 (0x2 = SMP 활성화)
+	 *     * 비트 24:    MT (Multithreading) 비트
+	 *     * 비트 23:0:  하드웨어 ID (실제 CPU 식별자)
+	 *   - 접근 방법:
+	 *     * 어셈블리: "mrc p15, 0, r0, c0, c0, 5" (MPIDR 읽기)
+	 *     * C 함수: read_cpuid_mpidr() (내부적으로 MRC 명령어 사용)
+	 *   - 사용 예시:
+	 *     * CPU 식별: 각 CPU가 자신의 고유 ID를 읽어서 구분
+	 *     * 토폴로지 파싱: 어피니티 레벨로 CPU 계층 구조 파악
+	 *     * 스케줄링: CPU 간 작업 분배 시 참조
+	 *
 	 * SMP (Symmetric Multi-Processing) 시스템:
 	 *   - 여러 CPU가 동등한 권한으로 메모리와 I/O를 공유하며 동작하는 멀티프로세서 시스템
 	 *   - 모든 CPU가 동일한 역할을 수행 (마스터/슬레이브 구분 없음)
@@ -649,6 +699,49 @@ void __init smp_setup_processor_id(void)
 	 *
 	 * 예시: mpidr = 0x00000102 (클러스터=1, 코어=0, 스레드=2)인 경우
 	 *       cpu = 2 (Level 0, 즉 스레드 ID)
+	 *
+	 * CPU의 계층 구조 (Affinity Level):
+	 *   현대 멀티코어 프로세서는 물리적 계층 구조를 가지며, MPIDR의 Affinity Level은
+	 *   이 계층 구조를 나타냅니다. 각 레벨은 CPU의 물리적 그룹핑과 공유 리소스를 의미합니다.
+	 *
+	 *   Level 2: 소켓/패키지 (Socket/Package)
+	 *     - 물리적 CPU 칩 전체를 나타냄 (예: 듀얼 소켓 서버의 각 CPU)
+	 *     - 같은 소켓의 CPU들은 메모리 컨트롤러와 L3 캐시를 공유
+	 *     - NUMA 노드와 밀접한 관련 (같은 소켓 = 같은 NUMA 노드)
+	 *
+	 *   Level 1: 클러스터 (Cluster)
+	 *     - 소켓 내부의 CPU 그룹을 나타냄 (예: big.LITTLE의 big 클러스터, LITTLE 클러스터)
+	 *     - 같은 클러스터의 CPU들은 L2 캐시를 공유
+	 *     - 클러스터별로 다른 성능 특성을 가질 수 있음
+	 *
+	 *   Level 0: 코어/스레드 (Core/Thread)
+	 *     - 멀티스레딩 활성화: 코어 내 스레드 ID (같은 코어의 하드웨어 스레드)
+	 *     - 멀티스레딩 비활성화: 코어 ID
+	 *     - 각 코어는 독립적인 L1 캐시를 가짐
+	 *
+	 *   예시 구조:
+	 *     Socket 0
+	 *       ├─ Cluster 0 (big)
+	 *       │   ├─ Core 0 (Thread 0, Thread 1)
+	 *       │   └─ Core 1 (Thread 0, Thread 1)
+	 *       └─ Cluster 1 (LITTLE)
+	 *           ├─ Core 0 (Thread 0)
+	 *           └─ Core 1 (Thread 0)
+	 *
+	 *   캐시 계층 구조:
+	 *     - L1 캐시: 코어별 (가장 빠름, 가장 작음)
+	 *     - L2 캐시: 클러스터별 (중간 속도, 중간 크기)
+	 *     - L3 캐시: 소켓별 (느리지만 큼, 모든 코어가 공유)
+	 *     - 메모리: 소켓별 (가장 느림, 가장 큼)
+	 *
+	 * 메모리 Locality와의 관계:
+	 *   Affinity Level은 CPU의 물리적 계층 구조를 나타내며, 직접적으로 메모리 할당을
+	 *   제어하는 것은 아닙니다. 하지만 같은 Affinity Level을 가진 CPU들은 보통:
+	 *   - 같은 캐시 계층 구조를 공유 (Level 1: L2 캐시)
+	 *   - 같은 메모리 노드에 가까울 수 있음 (Level 2: NUMA 노드)
+	 *   커널의 NUMA 정책이나 스케줄러가 이 정보를 활용하여 메모리 locality를 최적화합니다.
+	 *   예를 들어, 같은 클러스터의 CPU들은 같은 메모리 노드의 메모리를 사용하도록
+	 *   스케줄링될 수 있습니다.
 	 *
 	 * 매크로 위치:
 	 * - MPIDR_AFFINITY_LEVEL: arch/arm/include/asm/cputype.h:62

@@ -2,13 +2,27 @@
 #ifndef __ASM_ARM_CPUTYPE_H
 #define __ASM_ARM_CPUTYPE_H
 
-#define CPUID_ID	0
-#define CPUID_CACHETYPE	1
-#define CPUID_TCM	2
-#define CPUID_TLBTYPE	3
-#define CPUID_MPUIR	4
-#define CPUID_MPIDR	5
-#define CPUID_REVIDR	6
+/* CP15 레지스터 인덱스 정의
+ * CP15의 c0 레지스터에서 읽을 수 있는 다양한 CPU 정보 레지스터들의 인덱스
+ * MRC p15, 0, <Rd>, c0, c0, <index> 명령어에서 사용됨
+ *
+ * 사용 방법:
+ *   - read_cpuid(CPUID_MPIDR): MPIDR 레지스터 읽기
+ *   - read_cpuid(CPUID_ID): CPU ID 레지스터 읽기
+ *   - 각 상수는 MRC 명령어의 마지막 인자로 전달됨
+ */
+#define CPUID_ID	0	/* CPU ID 레지스터 (MIDR - Main ID Register) */
+#define CPUID_CACHETYPE	1	/* 캐시 타입 레지스터 */
+#define CPUID_TCM	2	/* TCM (Tightly Coupled Memory) 레지스터 */
+#define CPUID_TLBTYPE	3	/* TLB 타입 레지스터 */
+#define CPUID_MPUIR	4	/* MPU (Memory Protection Unit) ID 레지스터 */
+#define CPUID_MPIDR	5	/* MPIDR (Multiprocessor Affinity Register) 레지스터
+			    * 값: 5
+			    * 용도: read_cpuid(CPUID_MPIDR) 호출 시 사용
+			    * 의미: CP15의 c0 레지스터에서 MPIDR을 읽을 때의 인덱스
+			    * 예시: read_cpuid(CPUID_MPIDR) -> MRC p15, 0, <Rd>, c0, c0, 5
+			    */
+#define CPUID_REVIDR	6	/* Revision ID 레지스터 */
 
 #ifdef CONFIG_CPU_V7M
 #define CPUID_EXT_PFR0	0x40
@@ -55,10 +69,42 @@
 
 #define MPIDR_INVALID (~MPIDR_HWID_BITMASK)
 
-#define MPIDR_LEVEL_BITS 8
-#define MPIDR_LEVEL_MASK ((1 << MPIDR_LEVEL_BITS) - 1)
-#define MPIDR_LEVEL_SHIFT(level) (MPIDR_LEVEL_BITS * level)
+/* MPIDR 어피니티 레벨 관련 상수
+ * MPIDR 레지스터는 여러 어피니티 레벨로 구성되어 있으며,
+ * 각 레벨은 8비트(256개 값)를 사용합니다.
+ */
+#define MPIDR_LEVEL_BITS 8		/* 각 어피니티 레벨의 비트 수 */
+#define MPIDR_LEVEL_MASK ((1 << MPIDR_LEVEL_BITS) - 1)	/* 8비트 마스크 (0xFF) */
+#define MPIDR_LEVEL_SHIFT(level) (MPIDR_LEVEL_BITS * level)	/* 레벨별 시프트 값 */
 
+/**
+ * MPIDR_AFFINITY_LEVEL - MPIDR 레지스터에서 특정 어피니티 레벨 값 추출
+ *
+ * MPIDR 레지스터는 계층적 어피니티 구조를 가지고 있으며,
+ * 각 레벨은 8비트씩 할당되어 있습니다.
+ *
+ * @mpidr: MPIDR 레지스터 값
+ * @level: 추출할 어피니티 레벨 (0, 1, 2)
+ *
+ * 어피니티 레벨 구조:
+ *   - Level 0 (비트 7:0):   CPU 코어 내 스레드 ID 또는 코어 ID
+ *   - Level 1 (비트 15:8):  클러스터 ID
+ *   - Level 2 (비트 23:16): 소켓/패키지 ID
+ *
+ * 동작:
+ *   1. mpidr을 오른쪽으로 (8 * level) 비트만큼 시프트
+ *   2. 하위 8비트를 마스킹하여 추출
+ *
+ * 예시:
+ *   mpidr = 0x00010203 (Level2=1, Level1=2, Level0=3)
+ *   MPIDR_AFFINITY_LEVEL(mpidr, 0) = 0x03 (Level 0)
+ *   MPIDR_AFFINITY_LEVEL(mpidr, 1) = 0x02 (Level 1)
+ *   MPIDR_AFFINITY_LEVEL(mpidr, 2) = 0x01 (Level 2)
+ *
+ * 사용 예시:
+ *   - CPU 토폴로지 파싱: 각 레벨의 ID 추출
+ *   - 논리-물리 CPU 매핑: arch/arm/kernel/setup.c에서 사용
+ */
 #define MPIDR_AFFINITY_LEVEL(mpidr, level) \
 	((mpidr >> (MPIDR_LEVEL_BITS * level)) & MPIDR_LEVEL_MASK)
 
@@ -118,6 +164,31 @@ extern unsigned int processor_id;
 struct proc_info_list *lookup_processor(u32 midr);
 
 #ifdef CONFIG_CPU_CP15
+/**
+ * read_cpuid - CP15의 CPU 정보 레지스터 읽기 매크로
+ *
+ * CP15 (Coprocessor 15)의 c0 레지스터에서 CPU 정보를 읽어 반환하는 매크로입니다.
+ *
+ * @reg: 읽을 레지스터의 인덱스 (CPUID_ID, CPUID_MPIDR 등)
+ *
+ * 동작:
+ *   - MRC (Move to Register from Coprocessor) 어셈블리 명령어 사용
+ *   - 명령어 형식: "mrc p15, 0, <Rd>, c0, c0, <reg>"
+ *     * p15: Coprocessor 15 (시스템 제어 코프로세서)
+ *     * c0, c0: CP15의 레지스터 번호
+ *     * reg: 읽을 레지스터의 인덱스 (CPUID_* 상수)
+ *
+ * 반환값:
+ *   - 읽은 레지스터의 32비트 값
+ *
+ * 사용 예시:
+ *   - read_cpuid(CPUID_MPIDR): MPIDR 레지스터 읽기
+ *   - read_cpuid(CPUID_ID): CPU ID 레지스터 읽기
+ *
+ * 참고:
+ *   - CONFIG_CPU_CP15가 활성화된 경우에만 사용 가능
+ *   - 인라인 어셈블리로 구현되어 컴파일 타임에 최적화됨
+ */
 #define read_cpuid(reg)							\
 	({								\
 		unsigned int __val;					\
@@ -148,6 +219,10 @@ struct proc_info_list *lookup_processor(u32 midr);
 #include <asm/io.h>
 #include <asm/v7m.h>
 
+/* V7M 아키텍처용 fallback 구현
+ * V7M (ARMv7-M, Cortex-M 시리즈)는 CP15가 없으므로
+ * 이 함수 호출 시 경고를 출력하고 0을 반환합니다.
+ */
 #define read_cpuid(reg)							\
 	({								\
 		WARN_ON_ONCE(1);					\
@@ -162,8 +237,20 @@ static inline unsigned int __attribute_const__ read_cpuid_ext(unsigned offset)
 #else /* ifdef CONFIG_CPU_CP15 / elif defined (CONFIG_CPU_V7M) */
 
 /*
- * read_cpuid and read_cpuid_ext should only ever be called on machines that
- * have cp15 so warn on other usages.
+ * CP15가 없는 시스템용 fallback 구현
+ *
+ * 이 구현은 CP15 (Coprocessor 15)가 없는 오래된 ARM 프로세서나
+ * 특수한 아키텍처에서 사용됩니다.
+ *
+ * 동작:
+ *   - WARN_ON_ONCE(1): 경고 메시지 출력 (한 번만)
+ *   - 0 반환: 안전한 기본값
+ *
+ * 참고:
+ *   - CP15가 없는 시스템에서 이 함수가 호출되면 경고가 출력됩니다
+ *   - 대부분의 현대 ARM 프로세서는 CONFIG_CPU_CP15가 활성화되어
+ *     실제 MRC 명령어를 사용하는 구현(150번 줄)이 사용됩니다
+ *   - 이 fallback은 호환성을 위한 것이며, 실제로는 거의 사용되지 않습니다
  */
 #define read_cpuid(reg)							\
 	({								\
@@ -257,6 +344,88 @@ static inline unsigned int __attribute_const__ read_cpuid_tcmstatus(void)
 	return read_cpuid(CPUID_TCM);
 }
 
+/**
+ * read_cpuid_mpidr - MPIDR 레지스터 읽기
+ *
+ * CP15의 MPIDR (Multiprocessor Affinity Register) 레지스터 값을 읽어 반환합니다.
+ *
+ * 반환값:
+ *   - MPIDR 레지스터의 전체 32비트 값
+ *   - 각 CPU 코어마다 고유한 값 (하드웨어에서 부팅 시 자동 설정)
+ *   - 어피니티 레벨 정보 포함:
+ *     * 비트 7:0:   Affinity Level 0 (스레드/코어 ID)
+ *     * 비트 15:8:  Affinity Level 1 (클러스터 ID)
+ *     * 비트 23:16: Affinity Level 2 (소켓/패키지 ID)
+ *     * 비트 24:    MT (Multithreading) 비트
+ *     * 비트 31:30: SMP 모드 비트
+ *
+ * 사용 예시:
+ *   - CPU 식별: 각 CPU가 자신의 고유 ID를 읽어서 구분
+ *   - 토폴로지 파싱: 어피니티 레벨로 CPU 계층 구조 파악
+ *   - 논리-물리 CPU 매핑: smp_setup_processor_id()에서 사용
+ *
+ * 참고:
+ *   - 읽기 전용 레지스터 (하드웨어가 자동으로 설정)
+ *   - 내부적으로 MRC p15, 0, <Rd>, c0, c0, 5 어셈블리 명령어 사용
+ *   - SMP 시스템에서만 의미가 있으며, UP 시스템에서는 0 반환 가능
+ *   - 실제 하드웨어 ID만 필요하면 MPIDR_HWID_BITMASK로 마스킹 필요
+ *
+ * 동작 과정:
+ *   1. read_cpuid(CPUID_MPIDR) 호출
+ *   2. CPUID_MPIDR은 14번 줄에 정의된 상수로 값은 5
+ *   3. read_cpuid 매크로(150번 줄)가 확장되어 인라인 어셈블리로 변환:
+ *      asm("mrc p15, 0, %0, c0, c0, 5" : "=r" (__val) : : "cc")
+ *   4. MRC 명령어 실행:
+ *      - mrc: Move to Register from Coprocessor
+ *      - p15: Coprocessor 15 (시스템 제어 코프로세서)
+ *      - c0, c0: CP15의 레지스터 번호
+ *      - 5: 읽을 레지스터 인덱스 (CPUID_MPIDR)
+ *   5. MPIDR 레지스터의 32비트 값이 반환됨
+ */
+/**
+ * __attribute_const__ - 컴파일러 최적화 힌트 속성
+ *
+ * __attribute_const__는 GCC의 __attribute__((__const__))를 래핑한 매크로로,
+ * 함수가 인자에만 의존하고 전역 변수나 포인터를 통한 메모리 접근을 하지 않는다는 것을
+ * 컴파일러에 알려주는 최적화 힌트입니다.
+ *
+ * 역할:
+ *   1. 순수 함수 표시:
+ *      - 함수가 인자 값에만 의존하여 결과를 결정
+ *      - 같은 인자로 호출하면 항상 같은 결과 반환
+ *      - 전역 변수, 정적 변수, 포인터를 통한 메모리 읽기 없음
+ *
+ *   2. 컴파일러 최적화:
+ *      - 공통 서브표현식 제거 (CSE: Common Subexpression Elimination)
+ *        예: 같은 인자로 여러 번 호출 시 한 번만 계산하고 재사용
+ *      - 루프 불변 코드 이동 (LICM: Loop Invariant Code Motion)
+ *        예: 루프 내에서 같은 인자로 호출 시 루프 밖으로 이동
+ *      - 데드 코드 제거 (Dead Code Elimination)
+ *        예: 사용되지 않는 호출 제거
+ *
+ *   3. __attribute__((pure))와의 차이:
+ *      - pure: 전역 변수나 포인터를 통한 메모리 읽기는 가능하지만 쓰기는 없음
+ *      - const: 전역 변수나 포인터를 통한 메모리 읽기도 없음 (더 엄격)
+ *
+ * 사용 예시:
+ *   // 최적화 전:
+ *   for (int i = 0; i < 1000; i++) {
+ *       unsigned int mpidr = read_cpuid_mpidr();  // 매번 호출
+ *       // ... mpidr 사용
+ *   }
+ *
+ *   // 최적화 후 (컴파일러가 자동으로):
+ *   unsigned int mpidr = read_cpuid_mpidr();  // 한 번만 호출
+ *   for (int i = 0; i < 1000; i++) {
+ *       // ... mpidr 사용
+ *   }
+ *
+ * 주의사항:
+ *   - 함수가 실제로 순수 함수여야 함 (전역 변수 읽기, 메모리 접근 없음)
+ *   - 잘못 사용하면 잘못된 최적화로 인한 버그 발생 가능
+ *   - CPU 레지스터 읽기 같은 하드웨어 접근은 런타임에 값이 변할 수 있지만,
+ *     같은 CPU에서 같은 레지스터를 읽으면 항상 같은 값이므로 const로 표시 가능
+ */
 static inline unsigned int __attribute_const__ read_cpuid_mpidr(void)
 {
 	return read_cpuid(CPUID_MPIDR);
